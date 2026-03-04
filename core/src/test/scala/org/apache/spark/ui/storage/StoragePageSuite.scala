@@ -17,6 +17,9 @@
 
 package org.apache.spark.ui.storage
 
+import scala.xml.{Node, Text}
+
+import jakarta.servlet.http.HttpServletRequest
 import org.mockito.Mockito._
 
 import org.apache.spark.SparkFunSuite
@@ -29,6 +32,7 @@ class StoragePageSuite extends SparkFunSuite {
   val storageTab = mock(classOf[StorageTab])
   when(storageTab.basePath).thenReturn("http://localhost:4040")
   val storagePage = new StoragePage(storageTab, null)
+  val request = mock(classOf[HttpServletRequest])
 
   test("rddTable") {
     val rdd1 = new RDDStorageInfo(1,
@@ -43,8 +47,8 @@ class StoragePageSuite extends SparkFunSuite {
 
     val rdd2 = new RDDStorageInfo(2,
       "rdd2",
-      10,
-      5,
+      1000,
+      56,
       StorageLevel.DISK_ONLY.description,
       0L,
       200L,
@@ -53,15 +57,15 @@ class StoragePageSuite extends SparkFunSuite {
 
     val rdd3 = new RDDStorageInfo(3,
       "rdd3",
-      10,
-      10,
+      1000,
+      103,
       StorageLevel.MEMORY_AND_DISK_SER.description,
       400L,
       500L,
       None,
       None)
 
-    val xmlNodes = storagePage.rddTable(Seq(rdd1, rdd2, rdd3))
+    val xmlNodes = storagePage.rddTable(request, Seq(rdd1, rdd2, rdd3))
 
     val headers = Seq(
       "ID",
@@ -71,30 +75,45 @@ class StoragePageSuite extends SparkFunSuite {
       "Fraction Cached",
       "Size in Memory",
       "Size on Disk")
-    assert((xmlNodes \\ "th").map(_.text) === headers)
+
+    val headerRow: Seq[Node] = {
+      headers.zipWithIndex.map { x =>
+        storagePage.tooltips(x._2) match {
+          case Some(tooltip) =>
+            <th width={""} class={""}>
+              <span data-bs-toggle="tooltip" title={tooltip}>
+                {Text(x._1)}
+              </span>
+            </th>
+          case None => <th width={""} class={""}>{Text(x._1)}</th>
+        }
+      }
+    }
+    assert((xmlNodes \\ "th").map(_.text.trim) === headerRow.map(_.text.trim))
 
     assert((xmlNodes \\ "tr").size === 3)
     assert(((xmlNodes \\ "tr")(0) \\ "td").map(_.text.trim) ===
-      Seq("1", "rdd1", "Memory Deserialized 1x Replicated", "10", "100%", "100.0 B", "0.0 B"))
+      Seq("1", "rdd1", "Memory Deserialized 1x Replicated", "10", "100.00%", "100.0 B", "0.0 B"))
     // Check the url
     assert(((xmlNodes \\ "tr")(0) \\ "td" \ "a")(0).attribute("href").map(_.text) ===
-      Some("http://localhost:4040/storage/rdd?id=1"))
+      Some("http://localhost:4040/storage/rdd/?id=1"))
 
     assert(((xmlNodes \\ "tr")(1) \\ "td").map(_.text.trim) ===
-      Seq("2", "rdd2", "Disk Serialized 1x Replicated", "5", "50%", "0.0 B", "200.0 B"))
+      Seq("2", "rdd2", "Disk Serialized 1x Replicated", "56", "5.60%", "0.0 B", "200.0 B"))
     // Check the url
     assert(((xmlNodes \\ "tr")(1) \\ "td" \ "a")(0).attribute("href").map(_.text) ===
-      Some("http://localhost:4040/storage/rdd?id=2"))
+      Some("http://localhost:4040/storage/rdd/?id=2"))
 
     assert(((xmlNodes \\ "tr")(2) \\ "td").map(_.text.trim) ===
-      Seq("3", "rdd3", "Disk Memory Serialized 1x Replicated", "10", "100%", "400.0 B", "500.0 B"))
+      Seq("3", "rdd3", "Disk Memory Serialized 1x Replicated", "103", "10.30%", "400.0 B",
+        "500.0 B"))
     // Check the url
     assert(((xmlNodes \\ "tr")(2) \\ "td" \ "a")(0).attribute("href").map(_.text) ===
-      Some("http://localhost:4040/storage/rdd?id=3"))
+      Some("http://localhost:4040/storage/rdd/?id=3"))
   }
 
   test("empty rddTable") {
-    assert(storagePage.rddTable(Seq.empty).isEmpty)
+    assert(storagePage.rddTable(request, Seq.empty).isEmpty)
   }
 
   test("streamBlockStorageLevelDescriptionAndSize") {

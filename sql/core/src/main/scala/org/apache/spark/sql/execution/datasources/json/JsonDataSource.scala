@@ -18,10 +18,8 @@
 package org.apache.spark.sql.execution.datasources.json
 
 import java.io.InputStream
-import java.net.URI
 
 import com.fasterxml.jackson.core.{JsonFactory, JsonParser}
-import com.google.common.io.ByteStreams
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.io.Text
@@ -33,10 +31,13 @@ import org.apache.spark.input.{PortableDataStream, StreamInputFormat}
 import org.apache.spark.rdd.{BinaryFileRDD, RDD}
 import org.apache.spark.sql.{Dataset, Encoders, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.json.{CreateJacksonParser, JacksonParser, JSONOptions}
+import org.apache.spark.sql.catalyst.json.{CreateJacksonParser, JacksonParser, JsonInferSchema, JSONOptions}
+import org.apache.spark.sql.catalyst.util.FailureSafeParser
+import org.apache.spark.sql.classic.ClassicConversions.castToImpl
+import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.text.TextFileFormat
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.Utils
 
@@ -59,10 +60,14 @@ abstract class JsonDataSource extends Serializable {
       sparkSession: SparkSession,
       inputPaths: Seq[FileStatus],
       parsedOptions: JSONOptions): Option[StructType] = {
-    if (inputPaths.nonEmpty) {
-      Some(infer(sparkSession, inputPaths, parsedOptions))
-    } else {
-      None
+    parsedOptions.singleVariantColumn match {
+      case Some(columnName) => Some(StructType(Array(StructField(columnName, VariantType))))
+      case None =>
+        if (inputPaths.nonEmpty) {
+          Some(infer(sparkSession, inputPaths, parsedOptions))
+        } else {
+          None
+        }
     }
   }
 
@@ -104,24 +109,21 @@ object TextInputJsonDataSource extends JsonDataSource {
       CreateJacksonParser.internalRow(enc, _: JsonFactory, _: InternalRow)
     }.getOrElse(CreateJacksonParser.internalRow(_: JsonFactory, _: InternalRow))
 
-    JsonInferSchema.infer(rdd, parsedOptions, rowParser)
+    SQLExecution.withSQLConfPropagated(json.sparkSession) {
+      new JsonInferSchema(parsedOptions).infer(rdd, rowParser)
+    }
   }
 
   private def createBaseDataset(
       sparkSession: SparkSession,
       inputPaths: Seq[FileStatus],
       parsedOptions: JSONOptions): Dataset[String] = {
-    val paths = inputPaths.map(_.getPath.toString)
-    val textOptions = Map.empty[String, String] ++
-      parsedOptions.encoding.map("encoding" -> _) ++
-      parsedOptions.lineSeparator.map("lineSep" -> _)
-
     sparkSession.baseRelationToDataFrame(
       DataSource.apply(
         sparkSession,
-        paths = paths,
+        paths = inputPaths.map(_.getPath.toString),
         className = classOf[TextFileFormat].getName,
-        options = textOptions
+        options = parsedOptions.parameters ++ Map(DataSource.GLOB_PATHS_KEY -> "false")
       ).resolveRelation(checkFilesExist = false))
       .select("value").as(Encoders.STRING)
   }
@@ -131,8 +133,10 @@ object TextInputJsonDataSource extends JsonDataSource {
       file: PartitionedFile,
       parser: JacksonParser,
       schema: StructType): Iterator[InternalRow] = {
-    val linesReader = new HadoopFileLinesReader(file, parser.options.lineSeparatorInRead, conf)
-    Option(TaskContext.get()).foreach(_.addTaskCompletionListener(_ => linesReader.close()))
+    val linesReader = Utils.createResourceUninterruptiblyIfInTaskThread(
+      new HadoopFileLinesReader(file, parser.options.lineSeparatorInRead, conf)
+    )
+    Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => linesReader.close()))
     val textParser = parser.options.encoding
       .map(enc => CreateJacksonParser.text(enc, _: JsonFactory, _: Text))
       .getOrElse(CreateJacksonParser.text(_: JsonFactory, _: Text))
@@ -159,20 +163,25 @@ object MultiLineJsonDataSource extends JsonDataSource {
       sparkSession: SparkSession,
       inputPaths: Seq[FileStatus],
       parsedOptions: JSONOptions): StructType = {
-    val json: RDD[PortableDataStream] = createBaseRdd(sparkSession, inputPaths)
+    val json: RDD[PortableDataStream] = createBaseRdd(sparkSession, inputPaths, parsedOptions)
     val sampled: RDD[PortableDataStream] = JsonUtils.sample(json, parsedOptions)
     val parser = parsedOptions.encoding
       .map(enc => createParser(enc, _: JsonFactory, _: PortableDataStream))
       .getOrElse(createParser(_: JsonFactory, _: PortableDataStream))
 
-    JsonInferSchema.infer[PortableDataStream](sampled, parsedOptions, parser)
+    SQLExecution.withSQLConfPropagated(sparkSession) {
+      new JsonInferSchema(parsedOptions)
+        .infer[PortableDataStream](sampled, parser, isReadFile = true)
+    }
   }
 
   private def createBaseRdd(
       sparkSession: SparkSession,
-      inputPaths: Seq[FileStatus]): RDD[PortableDataStream] = {
+      inputPaths: Seq[FileStatus],
+      parsedOptions: JSONOptions): RDD[PortableDataStream] = {
     val paths = inputPaths.map(_.getPath)
-    val job = Job.getInstance(sparkSession.sessionState.newHadoopConf())
+    val job = Job.getInstance(sparkSession.sessionState.newHadoopConfWithOptions(
+      parsedOptions.parameters))
     val conf = job.getConfiguration
     val name = paths.mkString(",")
     FileInputFormat.setInputPaths(job, paths: _*)
@@ -208,9 +217,11 @@ object MultiLineJsonDataSource extends JsonDataSource {
       schema: StructType): Iterator[InternalRow] = {
     def partitionedFileString(ignored: Any): UTF8String = {
       Utils.tryWithResource {
-        CodecStreams.createInputStreamWithCloseResource(conf, new Path(new URI(file.filePath)))
+        Utils.createResourceUninterruptiblyIfInTaskThread {
+          CodecStreams.createInputStreamWithCloseResource(conf, file.toPath)
+        }
       } { inputStream =>
-        UTF8String.fromBytes(ByteStreams.toByteArray(inputStream))
+        UTF8String.fromBytes(inputStream.readAllBytes())
       }
     }
     val streamParser = parser.options.encoding
@@ -224,6 +235,6 @@ object MultiLineJsonDataSource extends JsonDataSource {
       parser.options.columnNameOfCorruptRecord)
 
     safeParser.parse(
-      CodecStreams.createInputStreamWithCloseResource(conf, new Path(new URI(file.filePath))))
+      CodecStreams.createInputStreamWithCloseResource(conf, file.toPath))
   }
 }

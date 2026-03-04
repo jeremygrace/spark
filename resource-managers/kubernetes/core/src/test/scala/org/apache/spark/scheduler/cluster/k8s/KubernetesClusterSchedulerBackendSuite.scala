@@ -16,100 +16,46 @@
  */
 package org.apache.spark.scheduler.cluster.k8s
 
-import java.util.concurrent.{ExecutorService, ScheduledExecutorService, TimeUnit}
+import java.util.Arrays
+import java.util.concurrent.TimeUnit
 
-import io.fabric8.kubernetes.api.model.{ContainerBuilder, DoneablePod, Pod, PodBuilder, PodList}
-import io.fabric8.kubernetes.client.{KubernetesClient, Watch, Watcher}
-import io.fabric8.kubernetes.client.Watcher.Action
-import io.fabric8.kubernetes.client.dsl.{FilterWatchListDeletable, MixedOperation, NonNamespaceOperation, PodResource}
-import org.hamcrest.{BaseMatcher, Description, Matcher}
-import org.mockito.{AdditionalAnswers, ArgumentCaptor, Matchers, Mock, MockitoAnnotations}
-import org.mockito.Matchers.{any, eq => mockitoEq}
-import org.mockito.Mockito.{doNothing, never, times, verify, when}
+import scala.jdk.CollectionConverters._
+
+import io.fabric8.kubernetes.api.model.{ConfigMap, Pod, PodBuilder, PodList}
+import io.fabric8.kubernetes.client.KubernetesClient
+import io.fabric8.kubernetes.client.dsl.PodResource
+import io.fabric8.kubernetes.client.dsl.base.PatchContext
+import org.jmock.lib.concurrent.DeterministicScheduler
+import org.mockito.{ArgumentCaptor, Mock, MockitoAnnotations}
+import org.mockito.ArgumentMatchers.{any, eq => mockitoEq}
+import org.mockito.Mockito.{atLeastOnce, mock, never, spy, verify, when}
 import org.scalatest.BeforeAndAfter
-import org.scalatest.mockito.MockitoSugar._
-import scala.collection.JavaConverters._
-import scala.concurrent.Future
 
-import org.apache.spark.{SparkConf, SparkContext, SparkFunSuite}
-import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesExecutorSpecificConf, SparkPod}
+import org.apache.spark.{SparkConf, SparkContext, SparkEnv, SparkFunSuite}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
-import org.apache.spark.rpc._
-import org.apache.spark.scheduler.{ExecutorExited, LiveListenerBus, SlaveLost, TaskSchedulerImpl}
-import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{RegisterExecutor, RemoveExecutor}
+import org.apache.spark.deploy.k8s.Fabric8Aliases._
+import org.apache.spark.resource.{ResourceProfile, ResourceProfileManager}
+import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
+import org.apache.spark.scheduler.{ExecutorKilled, ExecutorLossReason, LiveListenerBus, TaskSchedulerImpl}
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{RegisterExecutor, RemoveExecutor, StopDriver}
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
-import org.apache.spark.util.ThreadUtils
+import org.apache.spark.scheduler.cluster.k8s.ExecutorLifecycleTestUtils.TEST_SPARK_APP_ID
 
 class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAndAfter {
 
-  private val APP_ID = "test-spark-app"
-  private val DRIVER_POD_NAME = "spark-driver-pod"
-  private val NAMESPACE = "test-namespace"
-  private val SPARK_DRIVER_HOST = "localhost"
-  private val SPARK_DRIVER_PORT = 7077
-  private val POD_ALLOCATION_INTERVAL = "1m"
-  private val FIRST_EXECUTOR_POD = new PodBuilder()
-    .withNewMetadata()
-      .withName("pod1")
-      .endMetadata()
-    .withNewSpec()
-      .withNodeName("node1")
-      .endSpec()
-    .withNewStatus()
-      .withHostIP("192.168.99.100")
-      .endStatus()
-    .build()
-  private val SECOND_EXECUTOR_POD = new PodBuilder()
-    .withNewMetadata()
-      .withName("pod2")
-      .endMetadata()
-    .withNewSpec()
-      .withNodeName("node2")
-      .endSpec()
-    .withNewStatus()
-      .withHostIP("192.168.99.101")
-      .endStatus()
-    .build()
-
-  private type PODS = MixedOperation[Pod, PodList, DoneablePod, PodResource[Pod, DoneablePod]]
-  private type LABELED_PODS = FilterWatchListDeletable[
-    Pod, PodList, java.lang.Boolean, Watch, Watcher[Pod]]
-  private type IN_NAMESPACE_PODS = NonNamespaceOperation[
-    Pod, PodList, DoneablePod, PodResource[Pod, DoneablePod]]
+  private val schedulerExecutorService = new DeterministicScheduler()
+  private val sparkConf = new SparkConf(false)
+    .set("spark.executor.instances", "3")
+    .set("spark.app.id", TEST_SPARK_APP_ID)
+    .set(KUBERNETES_EXECUTOR_DECOMMISSION_LABEL.key, "soLong")
+    .set(KUBERNETES_EXECUTOR_DECOMMISSION_LABEL_VALUE.key, "cruelWorld")
 
   @Mock
-  private var sparkContext: SparkContext = _
+  private var sc: SparkContext = _
 
   @Mock
-  private var listenerBus: LiveListenerBus = _
-
-  @Mock
-  private var taskSchedulerImpl: TaskSchedulerImpl = _
-
-  @Mock
-  private var allocatorExecutor: ScheduledExecutorService = _
-
-  @Mock
-  private var requestExecutorsService: ExecutorService = _
-
-  @Mock
-  private var executorBuilder: KubernetesExecutorBuilder = _
-
-  @Mock
-  private var kubernetesClient: KubernetesClient = _
-
-  @Mock
-  private var podOperations: PODS = _
-
-  @Mock
-  private var podsWithLabelOperations: LABELED_PODS = _
-
-  @Mock
-  private var podsInNamespace: IN_NAMESPACE_PODS = _
-
-  @Mock
-  private var podsWithDriverName: PodResource[Pod, DoneablePod] = _
+  private var env: SparkEnv = _
 
   @Mock
   private var rpcEnv: RpcEnv = _
@@ -118,332 +64,254 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
   private var driverEndpointRef: RpcEndpointRef = _
 
   @Mock
-  private var executorPodsWatch: Watch = _
+  private var kubernetesClient: KubernetesClient = _
 
   @Mock
-  private var successFuture: Future[Boolean] = _
+  private var podOperations: PODS = _
 
-  private var sparkConf: SparkConf = _
-  private var executorPodsWatcherArgument: ArgumentCaptor[Watcher[Pod]] = _
-  private var allocatorRunnable: ArgumentCaptor[Runnable] = _
-  private var requestExecutorRunnable: ArgumentCaptor[Runnable] = _
+  @Mock
+  private var podsWithNamespace: PODS_WITH_NAMESPACE = _
+
+  @Mock
+  private var labeledPods: LABELED_PODS = _
+
+  @Mock
+  private var configMapsOperations: CONFIG_MAPS = _
+
+  @Mock
+  private var configMapsWithNamespace: CONFIG_MAPS_WITH_NAMESPACE = _
+
+  @Mock
+  private var configMapResource: CONFIG_MAPS_RESOURCE = _
+
+  @Mock
+  private var labeledConfigMaps: LABELED_CONFIG_MAPS = _
+
+  @Mock
+  private var taskScheduler: TaskSchedulerImpl = _
+
+  @Mock
+  private var eventQueue: ExecutorPodsSnapshotsStore = _
+
+  @Mock
+  private var podAllocator: ExecutorPodsAllocator = _
+
+  @Mock
+  private var lifecycleManager: ExecutorPodsLifecycleManager = _
+
+  @Mock
+  private var watchEvents: ExecutorPodsWatchSnapshotSource = _
+
+  @Mock
+  private var pollEvents: ExecutorPodsPollingSnapshotSource = _
+
+  @Mock
+  private var context: RpcCallContext = _
+
   private var driverEndpoint: ArgumentCaptor[RpcEndpoint] = _
+  private var schedulerBackendUnderTest: KubernetesClusterSchedulerBackend = _
 
-  private val driverPod = new PodBuilder()
-    .withNewMetadata()
-      .withName(DRIVER_POD_NAME)
-      .addToLabels(SPARK_APP_ID_LABEL, APP_ID)
-      .addToLabels(SPARK_ROLE_LABEL, SPARK_POD_DRIVER_ROLE)
-      .endMetadata()
-    .build()
+  private val listenerBus = new LiveListenerBus(new SparkConf())
+  private val resourceProfileManager = new ResourceProfileManager(sparkConf, listenerBus)
+  private val defaultProfile = ResourceProfile.getOrCreateDefaultProfile(sparkConf)
 
   before {
-    MockitoAnnotations.initMocks(this)
-    sparkConf = new SparkConf()
-      .set(KUBERNETES_DRIVER_POD_NAME, DRIVER_POD_NAME)
-      .set(KUBERNETES_NAMESPACE, NAMESPACE)
-      .set("spark.driver.host", SPARK_DRIVER_HOST)
-      .set("spark.driver.port", SPARK_DRIVER_PORT.toString)
-      .set(KUBERNETES_ALLOCATION_BATCH_DELAY.key, POD_ALLOCATION_INTERVAL)
-    executorPodsWatcherArgument = ArgumentCaptor.forClass(classOf[Watcher[Pod]])
-    allocatorRunnable = ArgumentCaptor.forClass(classOf[Runnable])
-    requestExecutorRunnable = ArgumentCaptor.forClass(classOf[Runnable])
+    MockitoAnnotations.openMocks(this).close()
+    when(taskScheduler.sc).thenReturn(sc)
+    when(sc.conf).thenReturn(sparkConf)
+    when(sc.resourceProfileManager).thenReturn(resourceProfileManager)
+    when(sc.env).thenReturn(env)
+    when(env.rpcEnv).thenReturn(rpcEnv)
     driverEndpoint = ArgumentCaptor.forClass(classOf[RpcEndpoint])
-    when(sparkContext.conf).thenReturn(sparkConf)
-    when(sparkContext.listenerBus).thenReturn(listenerBus)
-    when(taskSchedulerImpl.sc).thenReturn(sparkContext)
-    when(kubernetesClient.pods()).thenReturn(podOperations)
-    when(podOperations.withLabel(SPARK_APP_ID_LABEL, APP_ID)).thenReturn(podsWithLabelOperations)
-    when(podsWithLabelOperations.watch(executorPodsWatcherArgument.capture()))
-      .thenReturn(executorPodsWatch)
-    when(podOperations.inNamespace(NAMESPACE)).thenReturn(podsInNamespace)
-    when(podsInNamespace.withName(DRIVER_POD_NAME)).thenReturn(podsWithDriverName)
-    when(podsWithDriverName.get()).thenReturn(driverPod)
-    when(allocatorExecutor.scheduleWithFixedDelay(
-      allocatorRunnable.capture(),
-      mockitoEq(0L),
-      mockitoEq(TimeUnit.MINUTES.toMillis(1)),
-      mockitoEq(TimeUnit.MILLISECONDS))).thenReturn(null)
-    // Creating Futures in Scala backed by a Java executor service resolves to running
-    // ExecutorService#execute (as opposed to submit)
-    doNothing().when(requestExecutorsService).execute(requestExecutorRunnable.capture())
-    when(rpcEnv.setupEndpoint(
-      mockitoEq(CoarseGrainedSchedulerBackend.ENDPOINT_NAME), driverEndpoint.capture()))
+    when(
+      rpcEnv.setupEndpoint(
+        mockitoEq(CoarseGrainedSchedulerBackend.ENDPOINT_NAME),
+        driverEndpoint.capture()))
       .thenReturn(driverEndpointRef)
-
-    // Used by the CoarseGrainedSchedulerBackend when making RPC calls.
-    when(driverEndpointRef.ask[Boolean]
-      (any(classOf[Any]))
-      (any())).thenReturn(successFuture)
-    when(successFuture.failed).thenReturn(Future[Throwable] {
-      // emulate behavior of the Future.failed method.
-      throw new NoSuchElementException()
-    }(ThreadUtils.sameThread))
-  }
-
-  test("Basic lifecycle expectations when starting and stopping the scheduler.") {
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    assert(executorPodsWatcherArgument.getValue != null)
-    assert(allocatorRunnable.getValue != null)
-    scheduler.stop()
-    verify(executorPodsWatch).close()
-  }
-
-  test("Static allocation should request executors upon first allocator run.") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 2)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 2)
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    requestExecutorRunnable.getValue.run()
-    val firstResolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    val secondResolvedPod = expectPodCreationWithId(2, SECOND_EXECUTOR_POD)
-    when(podOperations.create(any(classOf[Pod]))).thenAnswer(AdditionalAnswers.returnsFirstArg())
-    allocatorRunnable.getValue.run()
-    verify(podOperations).create(firstResolvedPod)
-    verify(podOperations).create(secondResolvedPod)
-  }
-
-  test("Killing executors deletes the executor pods") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 2)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 2)
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    requestExecutorRunnable.getValue.run()
-    val firstResolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    val secondResolvedPod = expectPodCreationWithId(2, SECOND_EXECUTOR_POD)
-    when(podOperations.create(any(classOf[Pod])))
-      .thenAnswer(AdditionalAnswers.returnsFirstArg())
-    allocatorRunnable.getValue.run()
-    scheduler.doKillExecutors(Seq("2"))
-    requestExecutorRunnable.getAllValues.asScala.last.run()
-    verify(podOperations).delete(secondResolvedPod)
-    verify(podOperations, never()).delete(firstResolvedPod)
-  }
-
-  test("Executors should be requested in batches.") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 1)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 2)
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    requestExecutorRunnable.getValue.run()
-    when(podOperations.create(any(classOf[Pod])))
-      .thenAnswer(AdditionalAnswers.returnsFirstArg())
-    val firstResolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    val secondResolvedPod = expectPodCreationWithId(2, SECOND_EXECUTOR_POD)
-    allocatorRunnable.getValue.run()
-    verify(podOperations).create(firstResolvedPod)
-    verify(podOperations, never()).create(secondResolvedPod)
-    val registerFirstExecutorMessage = RegisterExecutor(
-      "1", mock[RpcEndpointRef], "localhost", 1, Map.empty[String, String])
-    when(taskSchedulerImpl.resourceOffers(any())).thenReturn(Seq.empty)
-    driverEndpoint.getValue.receiveAndReply(mock[RpcCallContext])
-      .apply(registerFirstExecutorMessage)
-    allocatorRunnable.getValue.run()
-    verify(podOperations).create(secondResolvedPod)
-  }
-
-  test("Scaled down executors should be cleaned up") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 1)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 1)
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-
-    // The scheduler backend spins up one executor pod.
-    requestExecutorRunnable.getValue.run()
-    when(podOperations.create(any(classOf[Pod])))
-      .thenAnswer(AdditionalAnswers.returnsFirstArg())
-    val resolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    allocatorRunnable.getValue.run()
-    val executorEndpointRef = mock[RpcEndpointRef]
-    when(executorEndpointRef.address).thenReturn(RpcAddress("pod.example.com", 9000))
-    val registerFirstExecutorMessage = RegisterExecutor(
-      "1", executorEndpointRef, "localhost:9000", 1, Map.empty[String, String])
-    when(taskSchedulerImpl.resourceOffers(any())).thenReturn(Seq.empty)
-    driverEndpoint.getValue.receiveAndReply(mock[RpcCallContext])
-      .apply(registerFirstExecutorMessage)
-
-    // Request that there are 0 executors and trigger deletion from driver.
-    scheduler.doRequestTotalExecutors(0)
-    requestExecutorRunnable.getAllValues.asScala.last.run()
-    scheduler.doKillExecutors(Seq("1"))
-    requestExecutorRunnable.getAllValues.asScala.last.run()
-    verify(podOperations, times(1)).delete(resolvedPod)
-    driverEndpoint.getValue.onDisconnected(executorEndpointRef.address)
-
-    val exitedPod = exitPod(resolvedPod, 0)
-    executorPodsWatcherArgument.getValue.eventReceived(Action.DELETED, exitedPod)
-    allocatorRunnable.getValue.run()
-
-    // No more deletion attempts of the executors.
-    // This is graceful termination and should not be detected as a failure.
-    verify(podOperations, times(1)).delete(resolvedPod)
-    verify(driverEndpointRef, times(1)).send(
-      RemoveExecutor("1", ExecutorExited(
-        0,
-        exitCausedByApp = false,
-        s"Container in pod ${exitedPod.getMetadata.getName} exited from" +
-          s" explicit termination request.")))
-  }
-
-  test("Executors that fail should not be deleted.") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 1)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 1)
-
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    val firstResolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    when(podOperations.create(any(classOf[Pod]))).thenAnswer(AdditionalAnswers.returnsFirstArg())
-    requestExecutorRunnable.getValue.run()
-    allocatorRunnable.getValue.run()
-    val executorEndpointRef = mock[RpcEndpointRef]
-    when(executorEndpointRef.address).thenReturn(RpcAddress("pod.example.com", 9000))
-    val registerFirstExecutorMessage = RegisterExecutor(
-      "1", executorEndpointRef, "localhost:9000", 1, Map.empty[String, String])
-    when(taskSchedulerImpl.resourceOffers(any())).thenReturn(Seq.empty)
-    driverEndpoint.getValue.receiveAndReply(mock[RpcCallContext])
-      .apply(registerFirstExecutorMessage)
-    driverEndpoint.getValue.onDisconnected(executorEndpointRef.address)
-    executorPodsWatcherArgument.getValue.eventReceived(
-      Action.ERROR, exitPod(firstResolvedPod, 1))
-
-    // A replacement executor should be created but the error pod should persist.
-    val replacementPod = expectPodCreationWithId(2, SECOND_EXECUTOR_POD)
-    scheduler.doRequestTotalExecutors(1)
-    requestExecutorRunnable.getValue.run()
-    allocatorRunnable.getAllValues.asScala.last.run()
-    verify(podOperations, never()).delete(firstResolvedPod)
-    verify(driverEndpointRef).send(
-      RemoveExecutor("1", ExecutorExited(
-        1,
-        exitCausedByApp = true,
-        s"Pod ${FIRST_EXECUTOR_POD.getMetadata.getName}'s executor container exited with" +
-          " exit status code 1.")))
-  }
-
-  test("Executors disconnected due to unknown reasons are deleted and replaced.") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 1)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 1)
-    val executorLostReasonCheckMaxAttempts = sparkConf.get(
-      KUBERNETES_EXECUTOR_LOST_REASON_CHECK_MAX_ATTEMPTS)
-
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    val firstResolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    when(podOperations.create(any(classOf[Pod]))).thenAnswer(AdditionalAnswers.returnsFirstArg())
-    requestExecutorRunnable.getValue.run()
-    allocatorRunnable.getValue.run()
-    val executorEndpointRef = mock[RpcEndpointRef]
-    when(executorEndpointRef.address).thenReturn(RpcAddress("pod.example.com", 9000))
-    val registerFirstExecutorMessage = RegisterExecutor(
-      "1", executorEndpointRef, "localhost:9000", 1, Map.empty[String, String])
-    when(taskSchedulerImpl.resourceOffers(any())).thenReturn(Seq.empty)
-    driverEndpoint.getValue.receiveAndReply(mock[RpcCallContext])
-      .apply(registerFirstExecutorMessage)
-
-    driverEndpoint.getValue.onDisconnected(executorEndpointRef.address)
-    1 to executorLostReasonCheckMaxAttempts foreach { _ =>
-      allocatorRunnable.getValue.run()
-      verify(podOperations, never()).delete(FIRST_EXECUTOR_POD)
-    }
-
-    val recreatedResolvedPod = expectPodCreationWithId(2, SECOND_EXECUTOR_POD)
-    allocatorRunnable.getValue.run()
-    verify(podOperations).delete(firstResolvedPod)
-    verify(driverEndpointRef).send(
-      RemoveExecutor("1", SlaveLost("Executor lost for unknown reasons.")))
-  }
-
-  test("Executors that fail to start on the Kubernetes API call rebuild in the next batch.") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 1)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 1)
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    val firstResolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    when(podOperations.create(firstResolvedPod))
-      .thenThrow(new RuntimeException("test"))
-    requestExecutorRunnable.getValue.run()
-    allocatorRunnable.getValue.run()
-    verify(podOperations, times(1)).create(firstResolvedPod)
-    val recreatedResolvedPod = expectPodCreationWithId(2, FIRST_EXECUTOR_POD)
-    allocatorRunnable.getValue.run()
-    verify(podOperations).create(recreatedResolvedPod)
-  }
-
-  test("Executors that are initially created but the watch notices them fail are rebuilt" +
-    " in the next batch.") {
-    sparkConf
-      .set(KUBERNETES_ALLOCATION_BATCH_SIZE, 1)
-      .set(org.apache.spark.internal.config.EXECUTOR_INSTANCES, 1)
-    val scheduler = newSchedulerBackend()
-    scheduler.start()
-    val firstResolvedPod = expectPodCreationWithId(1, FIRST_EXECUTOR_POD)
-    when(podOperations.create(FIRST_EXECUTOR_POD)).thenAnswer(AdditionalAnswers.returnsFirstArg())
-    requestExecutorRunnable.getValue.run()
-    allocatorRunnable.getValue.run()
-    verify(podOperations, times(1)).create(firstResolvedPod)
-    executorPodsWatcherArgument.getValue.eventReceived(Action.ERROR, firstResolvedPod)
-    val recreatedResolvedPod = expectPodCreationWithId(2, FIRST_EXECUTOR_POD)
-    allocatorRunnable.getValue.run()
-    verify(podOperations).create(recreatedResolvedPod)
-  }
-
-  private def newSchedulerBackend(): KubernetesClusterSchedulerBackend = {
-    new KubernetesClusterSchedulerBackend(
-      taskSchedulerImpl,
-      rpcEnv,
-      executorBuilder,
+    when(kubernetesClient.pods()).thenReturn(podOperations)
+    when(podOperations.inNamespace("default")).thenReturn(podsWithNamespace)
+    when(kubernetesClient.configMaps()).thenReturn(configMapsOperations)
+    when(configMapsOperations.inNamespace("default")).thenReturn(configMapsWithNamespace)
+    when(configMapsWithNamespace.resource(any[ConfigMap]())).thenReturn(configMapResource)
+    when(podAllocator.driverPod).thenReturn(None)
+    schedulerBackendUnderTest = new KubernetesClusterSchedulerBackend(
+      taskScheduler,
+      sc,
       kubernetesClient,
-      allocatorExecutor,
-      requestExecutorsService) {
-
-      override def applicationId(): String = APP_ID
-    }
+      schedulerExecutorService,
+      eventQueue,
+      podAllocator,
+      lifecycleManager,
+      watchEvents,
+      pollEvents)
   }
 
-  private def exitPod(basePod: Pod, exitCode: Int): Pod = {
-    new PodBuilder(basePod)
-      .editStatus()
-        .addNewContainerStatus()
-          .withNewState()
-            .withNewTerminated()
-              .withExitCode(exitCode)
-              .endTerminated()
-            .endState()
-          .endContainerStatus()
-        .endStatus()
-      .build()
+  after {
+    ResourceProfile.clearDefaultProfile()
   }
 
-  private def expectPodCreationWithId(executorId: Int, expectedPod: Pod): Pod = {
-    val resolvedPod = new PodBuilder(expectedPod)
-      .editMetadata()
-        .addToLabels(SPARK_EXECUTOR_ID_LABEL, executorId.toString)
+  test("Start all components") {
+    schedulerBackendUnderTest.start()
+    verify(podAllocator).setTotalExpectedExecutors(Map(defaultProfile -> 3))
+    verify(podAllocator).start(TEST_SPARK_APP_ID, schedulerBackendUnderTest)
+    verify(lifecycleManager).start(schedulerBackendUnderTest)
+    verify(watchEvents).start(TEST_SPARK_APP_ID)
+    verify(pollEvents).start(TEST_SPARK_APP_ID)
+    verify(configMapResource).create()
+  }
+
+  test("Stop all components") {
+    when(podsWithNamespace.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
+    when(labeledPods.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)).thenReturn(labeledPods)
+    when(configMapsWithNamespace.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID))
+      .thenReturn(labeledConfigMaps)
+    when(labeledConfigMaps.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE))
+      .thenReturn(labeledConfigMaps)
+    schedulerBackendUnderTest.stop()
+    verify(eventQueue).stop()
+    verify(watchEvents).stop()
+    verify(pollEvents).stop()
+    verify(podAllocator).stop(TEST_SPARK_APP_ID)
+    verify(labeledConfigMaps).delete()
+    verify(kubernetesClient).close()
+  }
+
+  test("Remove executor") {
+    val backend = spy[KubernetesClusterSchedulerBackend](schedulerBackendUnderTest)
+    when(backend.isExecutorActive(any())).thenReturn(false)
+    when(backend.isExecutorActive(mockitoEq("2"))).thenReturn(true)
+
+    backend.start()
+    backend.doRemoveExecutor("1", ExecutorKilled)
+    verify(driverEndpointRef).send(RemoveExecutor("1", ExecutorKilled))
+
+    backend.doRemoveExecutor("2", ExecutorKilled)
+    verify(driverEndpointRef).send(RemoveExecutor("2", ExecutorKilled))
+  }
+
+  test("SPARK-55639: doRemoveExecutor triggers setRecoveryMode on OOM") {
+    val backend = spy[KubernetesClusterSchedulerBackend](schedulerBackendUnderTest)
+    when(backend.isExecutorActive(any())).thenReturn(false)
+    backend.start()
+
+    val reason = mock(classOf[ExecutorLossReason])
+    when(reason.message).thenReturn("Executor lost due to OOM")
+
+    backend.doRemoveExecutor("1", reason)
+    verify(driverEndpointRef).send(RemoveExecutor("1", reason))
+    verify(podAllocator).setRecoveryMode()
+  }
+
+  test("Kill executors") {
+    schedulerBackendUnderTest.start()
+
+    when(podsWithNamespace.withField(any(), any())).thenReturn(labeledPods)
+    when(podsWithNamespace.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
+    when(labeledPods.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
+    when(labeledPods.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)).thenReturn(labeledPods)
+    when(labeledPods.withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1", "2")).thenReturn(labeledPods)
+    val pod1op = mock(classOf[PodResource])
+    val pod2op = mock(classOf[PodResource])
+    when(labeledPods.resources()).thenReturn(Arrays.asList[PodResource]().stream)
+    schedulerExecutorService.tick(sparkConf.get(KUBERNETES_DYN_ALLOC_KILL_GRACE_PERIOD) * 2,
+      TimeUnit.MILLISECONDS)
+    verify(labeledPods, never()).delete()
+
+    schedulerBackendUnderTest.doKillExecutors(Seq("1", "2"))
+    verify(driverEndpointRef).send(RemoveExecutor("1", ExecutorKilled))
+    verify(driverEndpointRef).send(RemoveExecutor("2", ExecutorKilled))
+    verify(labeledPods, never()).delete()
+    verify(pod1op, never()).patch(any(classOf[PatchContext]), any(classOf[Pod]))
+    verify(pod2op, never()).patch(any(classOf[PatchContext]), any(classOf[Pod]))
+    schedulerExecutorService.tick(sparkConf.get(KUBERNETES_DYN_ALLOC_KILL_GRACE_PERIOD) * 2,
+      TimeUnit.MILLISECONDS)
+    verify(labeledPods, never()).delete()
+    verify(pod1op, never()).patch(any(classOf[PatchContext]), any(classOf[Pod]))
+    verify(pod2op, never()).patch(any(classOf[PatchContext]), any(classOf[Pod]))
+
+    when(labeledPods.resources()).thenReturn(Arrays.asList(pod1op).stream)
+    val podList = mock(classOf[PodList])
+    when(labeledPods.list()).thenReturn(podList)
+    val pod1 = mock(classOf[Pod])
+    val pod2 = mock(classOf[Pod])
+    when(podList.getItems).thenReturn(Arrays.asList(pod1, pod2))
+
+    schedulerBackendUnderTest.doKillExecutors(Seq("1", "2"))
+    verify(labeledPods, never()).delete()
+    schedulerExecutorService.runUntilIdle()
+    verify(pod1op).patch(any(classOf[PatchContext]), any(classOf[Pod]))
+    verify(pod2op, never()).patch(any(classOf[PatchContext]), any(classOf[Pod]))
+    verify(labeledPods, never()).delete()
+    schedulerExecutorService.tick(sparkConf.get(KUBERNETES_DYN_ALLOC_KILL_GRACE_PERIOD) * 2,
+      TimeUnit.MILLISECONDS)
+    verify(labeledPods).delete()
+  }
+
+  test("Annotates executor pods with deletion cost when configured") {
+    sparkConf.set(KUBERNETES_EXECUTOR_POD_DELETION_COST, 7)
+    schedulerBackendUnderTest.start()
+
+    when(podsWithNamespace.withField(any(), any())).thenReturn(labeledPods)
+    when(podsWithNamespace.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
+    when(labeledPods.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
+    when(labeledPods.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)).thenReturn(labeledPods)
+    when(labeledPods.withLabelIn(SPARK_EXECUTOR_ID_LABEL, "3")).thenReturn(labeledPods)
+
+    val podResource = mock(classOf[PodResource])
+    val basePod = new PodBuilder()
+      .withNewMetadata()
+        .withName("exec-3")
+        .withNamespace("default")
         .endMetadata()
       .build()
-    val resolvedContainer = new ContainerBuilder().build()
-    when(executorBuilder.buildFromFeatures(Matchers.argThat(
-      new BaseMatcher[KubernetesConf[KubernetesExecutorSpecificConf]] {
-        override def matches(argument: scala.Any)
-          : Boolean = {
-          argument.isInstanceOf[KubernetesConf[KubernetesExecutorSpecificConf]] &&
-            argument.asInstanceOf[KubernetesConf[KubernetesExecutorSpecificConf]]
-              .roleSpecificConf.executorId == executorId.toString
-        }
 
-        override def describeTo(description: Description): Unit = {}
-      }))).thenReturn(SparkPod(resolvedPod, resolvedContainer))
-    new PodBuilder(resolvedPod)
-      .editSpec()
-        .addToContainers(resolvedContainer)
-        .endSpec()
-      .build()
+    val patchCaptor = ArgumentCaptor.forClass(classOf[Pod])
+    when(podResource.patch(any(), any(classOf[Pod]))).thenReturn(basePod)
+
+    when(labeledPods.resources())
+      .thenAnswer(_ => java.util.stream.Stream.of[PodResource](podResource))
+
+    val method = classOf[KubernetesClusterSchedulerBackend]
+      .getDeclaredMethods
+      .find(_.getName == "annotateExecutorDeletionCost")
+      .get
+    method.setAccessible(true)
+    method.invoke(schedulerBackendUnderTest, Seq("3"))
+    schedulerExecutorService.runUntilIdle()
+
+    verify(podResource, atLeastOnce()).patch(any(), patchCaptor.capture())
+    val appliedPods = patchCaptor.getAllValues.asScala
+    val annotated = appliedPods
+      .find(_.getMetadata.getAnnotations.asScala
+        .contains("controller.kubernetes.io/pod-deletion-cost"))
+    assert(annotated.isDefined,
+      s"expected controller.kubernetes.io/pod-deletion-cost annotation, got annotations " +
+        s"${appliedPods.map(_.getMetadata.getAnnotations).asJava}")
+    val annotations = annotated.get.getMetadata.getAnnotations.asScala
+    assert(annotations("controller.kubernetes.io/pod-deletion-cost") === "7")
+    sparkConf.remove(KUBERNETES_EXECUTOR_POD_DELETION_COST.key)
+  }
+
+  test("SPARK-34407: CoarseGrainedSchedulerBackend.stop may throw SparkException") {
+    schedulerBackendUnderTest.start()
+
+    when(driverEndpointRef.askSync[Boolean](StopDriver)).thenThrow(new RuntimeException)
+    schedulerBackendUnderTest.stop()
+
+    // Verify the last operation of `schedulerBackendUnderTest.stop`.
+    verify(kubernetesClient).close()
+  }
+
+  test("SPARK-34469: Ignore RegisterExecutor when SparkContext is stopped") {
+    when(sc.isStopped).thenReturn(true)
+    val endpoint = schedulerBackendUnderTest.createDriverEndpoint()
+    endpoint.receiveAndReply(null).apply(
+      RegisterExecutor("1", null, "host1", 1, Map.empty, Map.empty, Map.empty, 0))
+  }
+
+  test("Dynamically fetch an executor ID") {
+    val endpoint = schedulerBackendUnderTest.createDriverEndpoint()
+    endpoint.receiveAndReply(context).apply(GenerateExecID("cheeseBurger"))
+    verify(context).reply("1")
   }
 }

@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.aggregate
 
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, DeclarativeAggregate}
 import org.apache.spark.sql.catalyst.expressions.codegen._
+import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.types._
 
 /**
@@ -50,7 +51,7 @@ abstract class HashMapGenerator(
       val value = ctx.addMutableState(CodeGenerator.javaType(e.dataType), "bufValue")
       val ev = e.genCode(ctx)
       val initVars =
-        s"""
+        code"""
            | $isNull = ${ev.isNull};
            | $value = ${ev.value};
        """.stripMargin
@@ -128,7 +129,7 @@ abstract class HashMapGenerator(
   protected def generateRowIterator(): String
 
   protected final def generateClose(): String = {
-    s"""
+    """
        |public void close() {
        |  batch.close();
        |}
@@ -157,8 +158,10 @@ abstract class HashMapGenerator(
 
     dataType match {
       case BooleanType => hashInt(s"$input ? 1 : 0")
-      case ByteType | ShortType | IntegerType | DateType => hashInt(input)
-      case LongType | TimestampType => hashLong(input)
+      case ByteType | ShortType | IntegerType | DateType | _: YearMonthIntervalType =>
+        hashInt(input)
+      case LongType | TimestampType | TimestampNTZType | _: DayTimeIntervalType | _: TimeType =>
+        hashLong(input)
       case FloatType => hashInt(s"Float.floatToIntBits($input)")
       case DoubleType => hashLong(s"Double.doubleToLongBits($input)")
       case d: DecimalType =>
@@ -171,7 +174,12 @@ abstract class HashMapGenerator(
             ${hashBytes(bytes)}
           """
         }
-      case StringType => hashBytes(s"$input.getBytes()")
+      case st: StringType if st.supportsBinaryEquality =>
+        hashBytes(s"$input.getBytes()")
+      case st: StringType if !st.supportsBinaryEquality =>
+        hashLong(s"CollationFactory.fetchCollation(${st.collationId})" +
+          s".hashFunction.applyAsLong($input)")
+      case CalendarIntervalType => hashInt(s"$input.hashCode()")
     }
   }
 }

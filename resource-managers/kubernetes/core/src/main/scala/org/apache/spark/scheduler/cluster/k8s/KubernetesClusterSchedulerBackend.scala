@@ -16,433 +16,387 @@
  */
 package org.apache.spark.scheduler.cluster.k8s
 
-import java.io.Closeable
-import java.net.InetAddress
-import java.util.concurrent.{ConcurrentHashMap, ExecutorService, ScheduledExecutorService, TimeUnit}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
-import javax.annotation.concurrent.GuardedBy
+import java.util.concurrent.{ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 
-import io.fabric8.kubernetes.api.model._
-import io.fabric8.kubernetes.client.{KubernetesClient, KubernetesClientException, Watcher}
-import io.fabric8.kubernetes.client.Watcher.Action
-import scala.collection.JavaConverters._
-import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
+import scala.collection.mutable.HashMap
+import scala.concurrent.Future
 
-import org.apache.spark.SparkException
+import io.fabric8.kubernetes.api.model.Pod
+import io.fabric8.kubernetes.api.model.PodBuilder
+import io.fabric8.kubernetes.client.KubernetesClient
+import io.fabric8.kubernetes.client.dsl.base.{PatchContext, PatchType}
+
+import org.apache.spark.SparkContext
+import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
-import org.apache.spark.deploy.k8s.KubernetesConf
-import org.apache.spark.rpc.{RpcAddress, RpcEndpointAddress, RpcEnv}
-import org.apache.spark.scheduler.{ExecutorExited, SlaveLost, TaskSchedulerImpl}
+import org.apache.spark.deploy.k8s.submit.KubernetesClientUtils
+import org.apache.spark.deploy.security.HadoopDelegationTokenManager
+import org.apache.spark.internal.LogKeys.{COUNT, TOTAL}
+import org.apache.spark.internal.config.SCHEDULER_MIN_REGISTERED_RESOURCES_RATIO
+import org.apache.spark.resource.ResourceProfile
+import org.apache.spark.rpc.{RpcAddress, RpcCallContext}
+import org.apache.spark.scheduler.{ExecutorDecommission, ExecutorDecommissionInfo, ExecutorKilled, ExecutorLossReason,
+  TaskSchedulerImpl}
 import org.apache.spark.scheduler.cluster.{CoarseGrainedSchedulerBackend, SchedulerBackendUtils}
-import org.apache.spark.util.Utils
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RegisterExecutor
+import org.apache.spark.util.{ThreadUtils, Utils}
+import org.apache.spark.util.ArrayImplicits._
 
 private[spark] class KubernetesClusterSchedulerBackend(
     scheduler: TaskSchedulerImpl,
-    rpcEnv: RpcEnv,
-    executorBuilder: KubernetesExecutorBuilder,
+    sc: SparkContext,
     kubernetesClient: KubernetesClient,
-    allocatorExecutor: ScheduledExecutorService,
-    requestExecutorsService: ExecutorService)
-  extends CoarseGrainedSchedulerBackend(scheduler, rpcEnv) {
-
-  import KubernetesClusterSchedulerBackend._
-
-  private val EXECUTOR_ID_COUNTER = new AtomicLong(0L)
-  private val RUNNING_EXECUTOR_PODS_LOCK = new Object
-  @GuardedBy("RUNNING_EXECUTOR_PODS_LOCK")
-  private val runningExecutorsToPods = new mutable.HashMap[String, Pod]
-  private val executorPodsByIPs = new ConcurrentHashMap[String, Pod]()
-  private val podsWithKnownExitReasons = new ConcurrentHashMap[String, ExecutorExited]()
-  private val disconnectedPodsByExecutorIdPendingRemoval = new ConcurrentHashMap[String, Pod]()
-
-  private val kubernetesNamespace = conf.get(KUBERNETES_NAMESPACE)
-
-  private val kubernetesDriverPodName = conf
-    .get(KUBERNETES_DRIVER_POD_NAME)
-    .getOrElse(throw new SparkException("Must specify the driver pod name"))
-  private implicit val requestExecutorContext = ExecutionContext.fromExecutorService(
-    requestExecutorsService)
-
-  private val driverPod = kubernetesClient.pods()
-    .inNamespace(kubernetesNamespace)
-    .withName(kubernetesDriverPodName)
-    .get()
+    executorService: ScheduledExecutorService,
+    snapshotsStore: ExecutorPodsSnapshotsStore,
+    podAllocator: AbstractPodsAllocator,
+    lifecycleManager: ExecutorPodsLifecycleManager,
+    watchEvents: ExecutorPodsWatchSnapshotSource,
+    pollEvents: ExecutorPodsPollingSnapshotSource)
+    extends CoarseGrainedSchedulerBackend(scheduler, sc.env.rpcEnv) {
 
   protected override val minRegisteredRatio =
-    if (conf.getOption("spark.scheduler.minRegisteredResourcesRatio").isEmpty) {
+    if (conf.get(SCHEDULER_MIN_REGISTERED_RESOURCES_RATIO).isEmpty) {
       0.8
     } else {
       super.minRegisteredRatio
     }
 
-  private val executorWatchResource = new AtomicReference[Closeable]
-  private val totalExpectedExecutors = new AtomicInteger(0)
-
-  private val driverUrl = RpcEndpointAddress(
-    conf.get("spark.driver.host"),
-    conf.getInt("spark.driver.port", DEFAULT_DRIVER_PORT),
-    CoarseGrainedSchedulerBackend.ENDPOINT_NAME).toString
-
   private val initialExecutors = SchedulerBackendUtils.getInitialTargetExecutorNumber(conf)
 
-  private val podAllocationInterval = conf.get(KUBERNETES_ALLOCATION_BATCH_DELAY)
+  private val minRegisteredExecutors = initialExecutors * minRegisteredRatio
 
-  private val podAllocationSize = conf.get(KUBERNETES_ALLOCATION_BATCH_SIZE)
+  private val namespace = conf.get(KUBERNETES_NAMESPACE)
 
-  private val executorLostReasonCheckMaxAttempts = conf.get(
-    KUBERNETES_EXECUTOR_LOST_REASON_CHECK_MAX_ATTEMPTS)
+  private val PATCH_CONTEXT = PatchContext.of(PatchType.STRATEGIC_MERGE)
 
-  private val allocatorRunnable = new Runnable {
-
-    // Maintains a map of executor id to count of checks performed to learn the loss reason
-    // for an executor.
-    private val executorReasonCheckAttemptCounts = new mutable.HashMap[String, Int]
-
-    override def run(): Unit = {
-      handleDisconnectedExecutors()
-
-      val executorsToAllocate = mutable.Map[String, Pod]()
-      val currentTotalRegisteredExecutors = totalRegisteredExecutors.get
-      val currentTotalExpectedExecutors = totalExpectedExecutors.get
-      val currentNodeToLocalTaskCount = getNodesWithLocalTaskCounts()
-      RUNNING_EXECUTOR_PODS_LOCK.synchronized {
-        if (currentTotalRegisteredExecutors < runningExecutorsToPods.size) {
-          logDebug("Waiting for pending executors before scaling")
-        } else if (currentTotalExpectedExecutors <= runningExecutorsToPods.size) {
-          logDebug("Maximum allowed executor limit reached. Not scaling up further.")
-        } else {
-          for (_ <- 0 until math.min(
-            currentTotalExpectedExecutors - runningExecutorsToPods.size, podAllocationSize)) {
-            val executorId = EXECUTOR_ID_COUNTER.incrementAndGet().toString
-            val executorConf = KubernetesConf.createExecutorConf(
-              conf,
-              executorId,
-              applicationId(),
-              driverPod)
-            val executorPod = executorBuilder.buildFromFeatures(executorConf)
-            val podWithAttachedContainer = new PodBuilder(executorPod.pod)
-              .editOrNewSpec()
-                .addToContainers(executorPod.container)
-                .endSpec()
-              .build()
-
-            executorsToAllocate(executorId) = podWithAttachedContainer
-            logInfo(
-              s"Requesting a new executor, total executors is now ${runningExecutorsToPods.size}")
-          }
-        }
-      }
-
-      val allocatedExecutors = executorsToAllocate.mapValues { pod =>
-        Utils.tryLog {
-          kubernetesClient.pods().create(pod)
-        }
-      }
-
-      RUNNING_EXECUTOR_PODS_LOCK.synchronized {
-        allocatedExecutors.map {
-          case (executorId, attemptedAllocatedExecutor) =>
-            attemptedAllocatedExecutor.map { successfullyAllocatedExecutor =>
-              runningExecutorsToPods.put(executorId, successfullyAllocatedExecutor)
-            }
-        }
-      }
-    }
-
-    def handleDisconnectedExecutors(): Unit = {
-      // For each disconnected executor, synchronize with the loss reasons that may have been found
-      // by the executor pod watcher. If the loss reason was discovered by the watcher,
-      // inform the parent class with removeExecutor.
-      disconnectedPodsByExecutorIdPendingRemoval.asScala.foreach {
-        case (executorId, executorPod) =>
-          val knownExitReason = Option(podsWithKnownExitReasons.remove(
-            executorPod.getMetadata.getName))
-          knownExitReason.fold {
-            removeExecutorOrIncrementLossReasonCheckCount(executorId)
-          } { executorExited =>
-            logWarning(s"Removing executor $executorId with loss reason " + executorExited.message)
-            removeExecutor(executorId, executorExited)
-            // We don't delete the pod running the executor that has an exit condition caused by
-            // the application from the Kubernetes API server. This allows users to debug later on
-            // through commands such as "kubectl logs <pod name>" and
-            // "kubectl describe pod <pod name>". Note that exited containers have terminated and
-            // therefore won't take CPU and memory resources.
-            // Otherwise, the executor pod is marked to be deleted from the API server.
-            if (executorExited.exitCausedByApp) {
-              logInfo(s"Executor $executorId exited because of the application.")
-              deleteExecutorFromDataStructures(executorId)
-            } else {
-              logInfo(s"Executor $executorId failed because of a framework error.")
-              deleteExecutorFromClusterAndDataStructures(executorId)
-            }
-          }
-      }
-    }
-
-    def removeExecutorOrIncrementLossReasonCheckCount(executorId: String): Unit = {
-      val reasonCheckCount = executorReasonCheckAttemptCounts.getOrElse(executorId, 0)
-      if (reasonCheckCount >= executorLostReasonCheckMaxAttempts) {
-        removeExecutor(executorId, SlaveLost("Executor lost for unknown reasons."))
-        deleteExecutorFromClusterAndDataStructures(executorId)
-      } else {
-        executorReasonCheckAttemptCounts.put(executorId, reasonCheckCount + 1)
-      }
-    }
-
-    def deleteExecutorFromClusterAndDataStructures(executorId: String): Unit = {
-      deleteExecutorFromDataStructures(executorId).foreach { pod =>
-        kubernetesClient.pods().delete(pod)
-      }
-    }
-
-    def deleteExecutorFromDataStructures(executorId: String): Option[Pod] = {
-      disconnectedPodsByExecutorIdPendingRemoval.remove(executorId)
-      executorReasonCheckAttemptCounts -= executorId
-      podsWithKnownExitReasons.remove(executorId)
-      RUNNING_EXECUTOR_PODS_LOCK.synchronized {
-        runningExecutorsToPods.remove(executorId).orElse {
-          logWarning(s"Unable to remove pod for unknown executor $executorId")
-          None
-        }
-      }
+  private[k8s] def doRemoveExecutor(executorId: String, reason: ExecutorLossReason): Unit = {
+    removeExecutor(executorId, reason)
+    podAllocator match {
+      case allocator: ExecutorPodsAllocator if reason.message.contains("OOM") =>
+        logWarning("OOM is detected.")
+        allocator.setRecoveryMode()
+      case _ => // no-op
     }
   }
 
-  override def sufficientResourcesRegistered(): Boolean = {
-    totalRegisteredExecutors.get() >= initialExecutors * minRegisteredRatio
+  private def setUpExecutorConfigMap(driverPod: Option[Pod]): Unit = {
+    val configMapName = KubernetesClientUtils.configMapNameExecutor
+    val resolvedExecutorProperties =
+      Map(KUBERNETES_NAMESPACE.key -> namespace)
+    val confFilesMap = KubernetesClientUtils
+      .buildSparkConfDirFilesMap(configMapName, conf, resolvedExecutorProperties) ++
+      resolvedExecutorProperties
+    val labels =
+      Map(SPARK_APP_ID_LABEL -> applicationId(), SPARK_ROLE_LABEL -> SPARK_POD_EXECUTOR_ROLE)
+    val configMap = KubernetesClientUtils.buildConfigMap(configMapName, confFilesMap, labels)
+    KubernetesUtils.addOwnerReference(driverPod.orNull, Seq(configMap))
+    kubernetesClient.configMaps().inNamespace(namespace).resource(configMap).create()
+  }
+
+  /**
+   * Get an application ID associated with the job.
+   * This returns the string value of spark.app.id if set, otherwise
+   * the locally-generated ID.
+   *
+   * @return The application ID
+   */
+  override def applicationId(): String = {
+    conf.getOption("spark.app.id").getOrElse(KubernetesConf.getKubernetesAppId())
   }
 
   override def start(): Unit = {
     super.start()
-    executorWatchResource.set(
-      kubernetesClient
-        .pods()
-        .withLabel(SPARK_APP_ID_LABEL, applicationId())
-        .watch(new ExecutorPodsWatcher()))
-
-    allocatorExecutor.scheduleWithFixedDelay(
-      allocatorRunnable, 0L, podAllocationInterval, TimeUnit.MILLISECONDS)
-
-    if (!Utils.isDynamicAllocationEnabled(conf)) {
-      doRequestTotalExecutors(initialExecutors)
+    // Must be called before setting the executors
+    podAllocator.start(applicationId(), this)
+    val defaultProfile = scheduler.sc.resourceProfileManager.defaultResourceProfile
+    val initExecs = Map(defaultProfile -> initialExecutors)
+    podAllocator.setTotalExpectedExecutors(initExecs)
+    lifecycleManager.start(this)
+    watchEvents.start(applicationId())
+    pollEvents.start(applicationId())
+    if (!conf.get(KUBERNETES_EXECUTOR_DISABLE_CONFIGMAP)) {
+      setUpExecutorConfigMap(podAllocator.driverPod)
     }
   }
 
   override def stop(): Unit = {
-    // stop allocation of new resources and caches.
-    allocatorExecutor.shutdown()
-    allocatorExecutor.awaitTermination(30, TimeUnit.SECONDS)
+    // When `CoarseGrainedSchedulerBackend.stop` throws `SparkException`,
+    // K8s cluster scheduler should log and proceed in order to delete the K8s cluster resources.
+    Utils.tryLogNonFatalError {
+      super.stop()
+    }
 
-    // send stop message to executors so they shut down cleanly
-    super.stop()
+    Utils.tryLogNonFatalError {
+      snapshotsStore.stop()
+    }
 
-    try {
-      val resource = executorWatchResource.getAndSet(null)
-      if (resource != null) {
-        resource.close()
+    Utils.tryLogNonFatalError {
+      watchEvents.stop()
+    }
+
+    Utils.tryLogNonFatalError {
+      pollEvents.stop()
+    }
+
+    if (conf.get(KUBERNETES_DRIVER_SERVICE_DELETE_ON_TERMINATION)) {
+      Utils.tryLogNonFatalError {
+        kubernetesClient
+          .services()
+          .inNamespace(namespace)
+          .withLabel(SPARK_APP_ID_LABEL, applicationId())
+          .delete()
       }
-    } catch {
-      case e: Throwable => logWarning("Failed to close the executor pod watcher", e)
     }
 
-    // then delete the executor pods
-    Utils.tryLogNonFatalError {
-      deleteExecutorPodsOnStop()
-      executorPodsByIPs.clear()
+    if (conf.get(KUBERNETES_DRIVER_OWN_PVC)) {
+      Utils.tryLogNonFatalError {
+        kubernetesClient
+          .persistentVolumeClaims()
+          .inNamespace(namespace)
+          .withLabel(SPARK_APP_ID_LABEL, applicationId())
+          .delete()
+      }
     }
+
+    if (conf.get(KUBERNETES_DELETE_EXECUTORS)) {
+
+      podAllocator.stop(applicationId())
+
+      if (!conf.get(KUBERNETES_EXECUTOR_DISABLE_CONFIGMAP)) {
+        Utils.tryLogNonFatalError {
+          kubernetesClient
+            .configMaps()
+            .inNamespace(namespace)
+            .withLabel(SPARK_APP_ID_LABEL, applicationId())
+            .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+            .delete()
+        }
+      }
+    }
+
     Utils.tryLogNonFatalError {
-      logInfo("Closing kubernetes client")
+      ThreadUtils.shutdown(executorService)
+    }
+
+    Utils.tryLogNonFatalError {
       kubernetesClient.close()
     }
   }
 
-  /**
-   * @return A map of K8s cluster nodes to the number of tasks that could benefit from data
-   *         locality if an executor launches on the cluster node.
-   */
-  private def getNodesWithLocalTaskCounts() : Map[String, Int] = {
-    val nodeToLocalTaskCount = synchronized {
-      mutable.Map[String, Int]() ++ hostToLocalTaskCount
-    }
-
-    for (pod <- executorPodsByIPs.values().asScala) {
-      // Remove cluster nodes that are running our executors already.
-      // TODO: This prefers spreading out executors across nodes. In case users want
-      // consolidating executors on fewer nodes, introduce a flag. See the spark.deploy.spreadOut
-      // flag that Spark standalone has: https://spark.apache.org/docs/latest/spark-standalone.html
-      nodeToLocalTaskCount.remove(pod.getSpec.getNodeName).nonEmpty ||
-        nodeToLocalTaskCount.remove(pod.getStatus.getHostIP).nonEmpty ||
-        nodeToLocalTaskCount.remove(
-          InetAddress.getByName(pod.getStatus.getHostIP).getCanonicalHostName).nonEmpty
-    }
-    nodeToLocalTaskCount.toMap[String, Int]
+  override def doRequestTotalExecutors(
+      resourceProfileToTotalExecs: Map[ResourceProfile, Int]): Future[Boolean] = {
+    podAllocator.setTotalExpectedExecutors(resourceProfileToTotalExecs)
+    Future.successful(true)
   }
 
-  override def doRequestTotalExecutors(requestedTotal: Int): Future[Boolean] = Future[Boolean] {
-    totalExpectedExecutors.set(requestedTotal)
-    true
+  override def sufficientResourcesRegistered(): Boolean = {
+    totalRegisteredExecutors.get() >= minRegisteredExecutors
   }
 
-  override def doKillExecutors(executorIds: Seq[String]): Future[Boolean] = Future[Boolean] {
-    val podsToDelete = RUNNING_EXECUTOR_PODS_LOCK.synchronized {
-      executorIds.flatMap { executorId =>
-        runningExecutorsToPods.remove(executorId) match {
-          case Some(pod) =>
-            disconnectedPodsByExecutorIdPendingRemoval.put(executorId, pod)
-            Some(pod)
+  override def getExecutorIds(): Seq[String] = synchronized {
+    super.getExecutorIds()
+  }
 
-          case None =>
-            logWarning(s"Unable to remove pod for unknown executor $executorId")
-            None
+  // KEP 2255: When a Deployment or Replicaset is scaled down, the pods will be deleted in the
+  // order of the value of this annotation, ascending.
+  private def annotateExecutorDeletionCost(execIds: Seq[String]): Unit = {
+    conf.get(KUBERNETES_EXECUTOR_POD_DELETION_COST).foreach { cost =>
+      logInfo(s"Annotating executor pod(s) ${execIds.mkString(",")} with deletion cost $cost")
+      val annotateTask = new Runnable() {
+        override def run(): Unit = Utils.tryLogNonFatalError {
+          kubernetesClient
+            .pods()
+            .inNamespace(namespace)
+            .withLabel(SPARK_APP_ID_LABEL, applicationId())
+            .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+            .withLabelIn(SPARK_EXECUTOR_ID_LABEL, execIds: _*)
+            .resources()
+            .forEach { podResource =>
+              podResource.patch(PATCH_CONTEXT, new PodBuilder()
+                .withNewMetadata()
+                .addToAnnotations(POD_DELETION_COST, cost.toString)
+                .endMetadata()
+                .build())
+            }
+        }
+      }
+      executorService.execute(annotateTask)
+    }
+  }
+
+  private def labelDecommissioningExecs(execIds: Seq[String]) = {
+    // Only kick off the labeling task if we have a label.
+    conf.get(KUBERNETES_EXECUTOR_DECOMMISSION_LABEL).foreach { label =>
+      val value = conf.get(KUBERNETES_EXECUTOR_DECOMMISSION_LABEL_VALUE).getOrElse("")
+      val labelTask = new Runnable() {
+        override def run(): Unit = Utils.tryLogNonFatalError {
+          kubernetesClient.pods()
+            .inNamespace(namespace)
+            .withLabel(SPARK_APP_ID_LABEL, applicationId())
+            .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+            .withLabelIn(SPARK_EXECUTOR_ID_LABEL, execIds: _*)
+            .resources()
+            .forEach { podResource =>
+              podResource.patch(PATCH_CONTEXT, new PodBuilder()
+                .withNewMetadata()
+                .addToLabels(label, value)
+                .endMetadata()
+                .build())
+            }
+        }
+      }
+      executorService.execute(labelTask)
+    }
+  }
+
+  override def decommissionExecutors(
+      executorsAndDecomInfo: Array[(String, ExecutorDecommissionInfo)],
+      adjustTargetNumExecutors: Boolean,
+      triggeredByExecutor: Boolean): Seq[String] = {
+    // If decommissioning is triggered by the executor the K8s cluster manager has already
+    // picked the pod to evict so we don't need to update the labels.
+    if (!triggeredByExecutor) {
+      labelDecommissioningExecs(executorsAndDecomInfo.map(_._1).toImmutableArraySeq)
+      if (conf.get(KUBERNETES_ALLOCATION_PODS_ALLOCATOR).equals("deployment")) {
+        annotateExecutorDeletionCost(executorsAndDecomInfo.map(_._1).toImmutableArraySeq)
+      }
+    }
+    super.decommissionExecutors(executorsAndDecomInfo, adjustTargetNumExecutors,
+      triggeredByExecutor)
+  }
+
+  override def doKillExecutors(executorIds: Seq[String]): Future[Boolean] = {
+    // If we've decided to remove some executors we should tell Kubernetes that we don't care.
+    if (conf.get(KUBERNETES_ALLOCATION_PODS_ALLOCATOR).equals("deployment")) {
+      annotateExecutorDeletionCost(executorIds)
+    }
+    labelDecommissioningExecs(executorIds)
+
+    // Tell the executors to exit themselves.
+    executorIds.foreach { id =>
+      removeExecutor(id, ExecutorKilled)
+    }
+
+    // Give some time for the executors to shut themselves down, then forcefully kill any
+    // remaining ones. This intentionally ignores the configuration about whether pods
+    // should be deleted; only executors that shut down gracefully (and are then collected
+    // by the ExecutorPodsLifecycleManager) will respect that configuration.
+    val killTask = new Runnable() {
+      override def run(): Unit = Utils.tryLogNonFatalError {
+        val running = kubernetesClient
+          .pods()
+          .inNamespace(namespace)
+          .withField("status.phase", "Running")
+          .withLabel(SPARK_APP_ID_LABEL, applicationId())
+          .withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)
+          .withLabelIn(SPARK_EXECUTOR_ID_LABEL, executorIds: _*)
+
+        if (!running.list().getItems.isEmpty) {
+          logInfo(log"Forcefully deleting ${MDC(COUNT, running.list().getItems.size())} pods " +
+            log"(out of ${MDC(TOTAL, executorIds.size)}) that are still running after graceful " +
+            log"shutdown period.")
+          running.delete()
         }
       }
     }
+    executorService.schedule(killTask, conf.get(KUBERNETES_DYN_ALLOC_KILL_GRACE_PERIOD),
+      TimeUnit.MILLISECONDS)
 
-    kubernetesClient.pods().delete(podsToDelete: _*)
-    true
+    // Return an immediate success, since we can't confirm or deny that executors have been
+    // actually shut down without waiting too long and blocking the allocation thread, which
+    // waits on this future to complete, blocking further allocations / deallocations.
+    //
+    // This relies a lot on the guarantees of Spark's RPC system, that a message will be
+    // delivered to the destination unless there's an issue with the connection, in which
+    // case the executor will shut itself down (and the driver, separately, will just declare
+    // it as "lost"). Coupled with the allocation manager keeping track of which executors are
+    // pending release, returning "true" here means that eventually all the requested executors
+    // will be removed.
+    //
+    // The cleanup timer above is just an optimization to make sure that stuck executors don't
+    // stick around in the k8s server. Normally it should never delete any pods at all.
+    Future.successful(true)
   }
 
-  private def deleteExecutorPodsOnStop(): Unit = {
-    val executorPodsToDelete = RUNNING_EXECUTOR_PODS_LOCK.synchronized {
-      val runningExecutorPodsCopy = Seq(runningExecutorsToPods.values.toSeq: _*)
-      runningExecutorsToPods.clear()
-      runningExecutorPodsCopy
-    }
-    kubernetesClient.pods().delete(executorPodsToDelete: _*)
+  override def createDriverEndpoint(): DriverEndpoint = {
+    new KubernetesDriverEndpoint()
   }
 
-  private class ExecutorPodsWatcher extends Watcher[Pod] {
+  val execId = new AtomicInteger(0)
 
-    private val DEFAULT_CONTAINER_FAILURE_EXIT_STATUS = -1
+  override protected def createTokenManager(): Option[HadoopDelegationTokenManager] = {
+    Some(new HadoopDelegationTokenManager(conf, sc.hadoopConfiguration, driverEndpoint))
+  }
 
-    override def eventReceived(action: Action, pod: Pod): Unit = {
-      val podName = pod.getMetadata.getName
-      val podIP = pod.getStatus.getPodIP
+  override protected def isExecutorExcluded(executorId: String, hostname: String): Boolean = {
+    podAllocator.isDeleted(executorId)
+  }
 
-      action match {
-        case Action.MODIFIED if (pod.getStatus.getPhase == "Running"
-            && pod.getMetadata.getDeletionTimestamp == null) =>
-          val clusterNodeName = pod.getSpec.getNodeName
-          logInfo(s"Executor pod $podName ready, launched at $clusterNodeName as IP $podIP.")
-          executorPodsByIPs.put(podIP, pod)
+  private class KubernetesDriverEndpoint extends DriverEndpoint {
 
-        case Action.DELETED | Action.ERROR =>
-          val executorId = getExecutorId(pod)
-          logDebug(s"Executor pod $podName at IP $podIP was at $action.")
-          if (podIP != null) {
-            executorPodsByIPs.remove(podIP)
+    protected val execIDRequester = new HashMap[RpcAddress, String]
+
+    private def generateExecID(context: RpcCallContext): PartialFunction[Any, Unit] = {
+      case x: GenerateExecID =>
+        val newId = execId.incrementAndGet().toString
+        context.reply(newId)
+        val executorAddress = context.senderAddress
+        execIDRequester(executorAddress) = newId
+        // Generally this should complete quickly but safer to not block in-case we're in the
+        // middle of an etcd fail over or otherwise slower writes.
+        val labelTask = new Runnable() {
+          override def run(): Unit = Utils.tryLogNonFatalError {
+            // Label the pod with it's exec ID
+            kubernetesClient.pods()
+              .inNamespace(namespace)
+              .withName(x.podName)
+              .patch(PATCH_CONTEXT, new PodBuilder()
+                .withNewMetadata()
+                .addToLabels(SPARK_EXECUTOR_ID_LABEL, newId)
+                .endMetadata()
+                .build())
           }
-
-          val executorExitReason = if (action == Action.ERROR) {
-            logWarning(s"Received error event of executor pod $podName. Reason: " +
-              pod.getStatus.getReason)
-            executorExitReasonOnError(pod)
-          } else if (action == Action.DELETED) {
-            logWarning(s"Received delete event of executor pod $podName. Reason: " +
-              pod.getStatus.getReason)
-            executorExitReasonOnDelete(pod)
-          } else {
-            throw new IllegalStateException(
-              s"Unknown action that should only be DELETED or ERROR: $action")
-          }
-          podsWithKnownExitReasons.put(pod.getMetadata.getName, executorExitReason)
-
-          if (!disconnectedPodsByExecutorIdPendingRemoval.containsKey(executorId)) {
-            log.warn(s"Executor with id $executorId was not marked as disconnected, but the " +
-              s"watch received an event of type $action for this executor. The executor may " +
-              "have failed to start in the first place and never registered with the driver.")
-          }
-          disconnectedPodsByExecutorIdPendingRemoval.put(executorId, pod)
-
-        case _ => logDebug(s"Received event of executor pod $podName: " + action)
-      }
+        }
+        executorService.execute(labelTask)
+    }
+    private def ignoreRegisterExecutorAtStoppedContext: PartialFunction[Any, Unit] = {
+      case _: RegisterExecutor if sc.isStopped => // No-op
     }
 
-    override def onClose(cause: KubernetesClientException): Unit = {
-      logDebug("Executor pod watch closed.", cause)
-    }
-
-    private def getExecutorExitStatus(pod: Pod): Int = {
-      val containerStatuses = pod.getStatus.getContainerStatuses
-      if (!containerStatuses.isEmpty) {
-        // we assume the first container represents the pod status. This assumption may not hold
-        // true in the future. Revisit this if side-car containers start running inside executor
-        // pods.
-        getExecutorExitStatus(containerStatuses.get(0))
-      } else DEFAULT_CONTAINER_FAILURE_EXIT_STATUS
-    }
-
-    private def getExecutorExitStatus(containerStatus: ContainerStatus): Int = {
-      Option(containerStatus.getState).map { containerState =>
-        Option(containerState.getTerminated).map { containerStateTerminated =>
-          containerStateTerminated.getExitCode.intValue()
-        }.getOrElse(UNKNOWN_EXIT_CODE)
-      }.getOrElse(UNKNOWN_EXIT_CODE)
-    }
-
-    private def isPodAlreadyReleased(pod: Pod): Boolean = {
-      val executorId = pod.getMetadata.getLabels.get(SPARK_EXECUTOR_ID_LABEL)
-      RUNNING_EXECUTOR_PODS_LOCK.synchronized {
-        !runningExecutorsToPods.contains(executorId)
-      }
-    }
-
-    private def executorExitReasonOnError(pod: Pod): ExecutorExited = {
-      val containerExitStatus = getExecutorExitStatus(pod)
-      // container was probably actively killed by the driver.
-      if (isPodAlreadyReleased(pod)) {
-        ExecutorExited(containerExitStatus, exitCausedByApp = false,
-          s"Container in pod ${pod.getMetadata.getName} exited from explicit termination " +
-            "request.")
-      } else {
-        val containerExitReason = s"Pod ${pod.getMetadata.getName}'s executor container " +
-          s"exited with exit status code $containerExitStatus."
-        ExecutorExited(containerExitStatus, exitCausedByApp = true, containerExitReason)
-      }
-    }
-
-    private def executorExitReasonOnDelete(pod: Pod): ExecutorExited = {
-      val exitMessage = if (isPodAlreadyReleased(pod)) {
-        s"Container in pod ${pod.getMetadata.getName} exited from explicit termination request."
-      } else {
-        s"Pod ${pod.getMetadata.getName} deleted or lost."
-      }
-      ExecutorExited(getExecutorExitStatus(pod), exitCausedByApp = false, exitMessage)
-    }
-
-    private def getExecutorId(pod: Pod): String = {
-      val executorId = pod.getMetadata.getLabels.get(SPARK_EXECUTOR_ID_LABEL)
-      require(executorId != null, "Unexpected pod metadata; expected all executor pods " +
-        s"to have label $SPARK_EXECUTOR_ID_LABEL.")
-      executorId
-    }
-  }
-
-  override def createDriverEndpoint(properties: Seq[(String, String)]): DriverEndpoint = {
-    new KubernetesDriverEndpoint(rpcEnv, properties)
-  }
-
-  private class KubernetesDriverEndpoint(
-      rpcEnv: RpcEnv,
-      sparkProperties: Seq[(String, String)])
-    extends DriverEndpoint(rpcEnv, sparkProperties) {
+    override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] =
+      generateExecID(context).orElse(
+        ignoreRegisterExecutorAtStoppedContext.orElse(
+          super.receiveAndReply(context)))
 
     override def onDisconnected(rpcAddress: RpcAddress): Unit = {
-      addressToExecutorId.get(rpcAddress).foreach { executorId =>
-        if (disableExecutor(executorId)) {
-          RUNNING_EXECUTOR_PODS_LOCK.synchronized {
-            runningExecutorsToPods.get(executorId).foreach { pod =>
-              disconnectedPodsByExecutorIdPendingRemoval.put(executorId, pod)
-            }
+      val execId = addressToExecutorId.get(rpcAddress)
+      execId match {
+        case Some(id) =>
+          executorsPendingDecommission.get(id) match {
+            case Some(host) =>
+              // We don't pass through the host because by convention the
+              // host is only populated if the entire host is going away
+              // and we don't know if that's the case or just one container.
+              removeExecutor(id, ExecutorDecommission(None))
+            case _ =>
+              // Don't do anything besides disabling the executor - allow the K8s API events to
+              // drive the rest of the lifecycle decisions.
+              // If it's disconnected due to network issues eventually heartbeat will clear it up.
+              disableExecutor(id)
           }
-        }
+        case _ =>
+          val newExecId = execIDRequester.get(rpcAddress)
+          newExecId match {
+            case Some(id) =>
+              execIDRequester -= rpcAddress
+              // Expected, executors re-establish a connection with an ID
+            case _ =>
+              logDebug(s"No executor found for ${rpcAddress}")
+          }
       }
     }
   }
-}
 
-private object KubernetesClusterSchedulerBackend {
-  private val UNKNOWN_EXIT_CODE = -1
 }
